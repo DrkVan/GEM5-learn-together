@@ -6,83 +6,97 @@
 
 ```cpp
 
-/** Forward declared to break the cyclic inclusion dependencies between
- *  pipeline and cpu */
+/* 提前声明，解决Pipeline和MinorCPU类的循环依赖，也就是解决头文件互相引用的问题*/
+/* 这样做是为了允许MinorCPU类通过指针引用Pipeline而无需包含完整定义*/
 class Pipeline;
 
-/** Minor will use the SimpleThread state for now */
+/* 线程类型定义，将SimpleThread重命名为MinorThread，作为MinorCPU的线程实现 */
 typedef SimpleThread MinorThread;
 
 } // namespace minor
 
-/**
- *  MinorCPU is an in-order CPU model with four fixed pipeline stages:
- *
- *  Fetch1 - fetches lines from memory
- *  Fetch2 - decomposes lines into macro-op instructions
- *  Decode - decomposes macro-ops into micro-ops
- *  Execute - executes those micro-ops
- *
- *  This pipeline is carried in the MinorCPU::pipeline object.
- *  The exec_context interface is not carried by MinorCPU but by
- *      minor::ExecContext objects
- *  created by minor::Execute.
- */
 class MinorCPU : public BaseCPU
 {
   protected:
-    /** pipeline is a container for the clockable pipeline stage objects.
-     *  Elements of pipeline call TheISA to implement the model. */
+    /* 前面提到的，指向流水线管理的指针，pipeline负责协调Fetch1/Fetch2/Decode/Execute阶段 */
     minor::Pipeline *pipeline;
-
+    /* 随机数生成器，用于线程调度里面的随机策略（线程调度策略里面有一个随机优先级）*/
     Random::RandomPtr rng = Random::genRandom();
 
   public:
-    /** Activity recording for pipeline.  This belongs to Pipeline but
-     *  stages will access it through the CPU as the MinorCPU object
-     *  actually mediates idling behaviour */
+    /* ActivityRecorder是活动状态记录器，用于调试和性能分析 */
     minor::MinorActivityRecorder *activityRecorder;
 
-    /** These are thread state-representing objects for this CPU.  If
-     *  you need a ThreadContext for *any* reason, use
-     *  threads[threadId]->getTC() */
+    /* 存储所有线程的指针，每个线程对应一个MinorThread(也就是SimpleThread) */
+    /* 这样做是方便获得线程上下文，通过threads[threadId]->getTC()来获得线程上下文*/
     std::vector<minor::MinorThread *> threads;
 
   public:
-    /** Provide a non-protected base class for Minor's Ports as derived
-     *  classes are created by Fetch1 and Execute */
+    /* 定义CPU与内存系统交互的端口基类，RequestPort等Port类的解析参阅${FILE_ROOT}/Appendix/Port基类*/
     class MinorCPUPort : public RequestPort
     {
       public:
-        /** The enclosing cpu */
         MinorCPU &cpu;
-
       public:
         MinorCPUPort(const std::string& name_, MinorCPU &cpu_)
             : RequestPort(name_), cpu(cpu_)
         { }
-
     };
 
-    /** Thread Scheduling Policy (RoundRobin, Random, etc) */
+    /* 通过BaseMinorCPUParams参数设置（也就是Python脚本里指定的策略），影响roundRobinPriority()等策略的调用 */
     enums::ThreadPolicy threadPolicy;
   protected:
-     /** Return a reference to the data port. */
+     /* 返回Execute阶段与DCache连接的Port */
     Port &getDataPort() override;
 
-    /** Return a reference to the instruction port. */
+    /* 返回Fetch1阶段与ICache连接的Port */
     Port &getInstPort() override;
 
   public:
+    /* 构造函数*/
     MinorCPU(const BaseMinorCPUParams &params);
-
+    /* 析构函数*/
     ~MinorCPU();
 
   public:
-    /** Starting, waking and initialisation */
-    void init() override;
-    void startup() override;
-    void wakeup(ThreadID tid) override;
+    /* 初始化线程和内存映射 */
+    void init() override
+    {
+        /* 调用基类方法，BaseCPU基类的解析参阅${FILE_ROOT}/Appendix/BaseCPU基类.md */
+        BaseCPU::init();
+        /* 错误检查，要求MinorCPU的内存是Timing的内存*/
+        if (!params().switched_out && system->getMemoryMode() != enums::timing) {
+            fatal("The Minor CPU requires the memory system to be in "
+                "'timing' mode.\n");
+        }
+    }
+
+    /* 启动流水线时钟事件*/
+    void startup() override
+    {
+        DPRINTF(MinorCPU, "MinorCPU startup\n"); 
+
+        /* 调用基类方法startup*/
+        BaseCPU::startup();
+
+        for (ThreadID tid = 0; tid < numThreads; tid++)
+            /* 对于每一个线程，调用wakeupFetch()*/
+            pipeline->wakeupFetch(tid);
+    }
+
+    /* 唤醒挂起的线程*/
+    void wakeup(ThreadID tid) override
+    {
+        DPRINTF(Drain, "[tid:%d] MinorCPU wakeup\n", tid);
+        assert(tid < numThreads);
+        /* 如果线程的状态是挂起的话，就唤醒线程*/
+        if (threads[tid]->status() == ThreadContext::Suspended) {
+            threads[tid]->activate();
+        }
+    }
+
+
+
 
     /** Processor-specific statistics */
     minor::MinorStats stats;
@@ -156,3 +170,5 @@ class MinorCPU : public BaseCPU
 
 
 ```
+
+我们来一个总结：
